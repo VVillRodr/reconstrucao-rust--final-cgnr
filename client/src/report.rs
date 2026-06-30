@@ -1,5 +1,4 @@
 use common::ReconstructionRequest;
-use ndarray::Array1;
 use reqwest::Client;
 use std::fmt;
 use std::fs::File;
@@ -17,23 +16,6 @@ fn resolve_csv_path(file_path: &str) -> PathBuf {
         .to_path_buf();
 
     workspace_root.join(file_path)
-}
-
-fn read_g_vector_from_csv(file_path: &str) -> Result<Array1<f64>, String> {
-    let full_path = resolve_csv_path(file_path);
-
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(false)
-        .from_path(&full_path)
-        .map_err(|e| format!("{} (path: {})", e.to_string(), full_path.display()))?;
-
-    let mut data = Vec::new();
-    for result in reader.records() {
-        let record = result.map_err(|e| e.to_string())?;
-        let value: f64 = record[0].trim().parse().map_err(|e: std::num::ParseFloatError| e.to_string())?;
-        data.push(value);
-    }
-    Ok(Array1::from(data))
 }
 
 struct ReportEntry {
@@ -78,14 +60,6 @@ async fn main() {
     for signal_file in signal_files.iter() {
         println!("[Report] Processando arquivo {}", signal_file);
 
-        let g_vector = match read_g_vector_from_csv(signal_file) {
-            Ok(g) => g,
-            Err(err) => {
-                eprintln!("[Report] Erro ao ler {}: {}", signal_file, err);
-                continue;
-            }
-        };
-
         let model_id = if signal_file.to_lowercase().contains("60x60") {
             "60x60"
         } else {
@@ -97,7 +71,7 @@ async fn main() {
                 user_id: Uuid::new_v4(),
                 algorithm_id: algorithm.to_string(),
                 model_id: model_id.to_string(),
-                g: g_vector.to_vec(),
+                signal_file: signal_file.to_string(),
             };
 
             println!("[Report] Enviando {} para {}...", algorithm, signal_file);

@@ -41,7 +41,7 @@ pub struct ReconstructionRequest {
     pub user_id: Uuid, // ALTERADO: de u32 para Uuid
     pub model_id: String,
     pub algorithm_id: String,
-    pub g: Vec<f64>,
+    pub signal_file: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

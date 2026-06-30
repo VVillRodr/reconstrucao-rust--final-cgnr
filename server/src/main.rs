@@ -3,7 +3,8 @@ mod reconstruction;
 use axum::{extract::State, http::StatusCode, response::Json, routing::{get, post}, Router};
 // ALTERADO: Importações adicionais
 use common::{ReconstructionRequest, ReconstructionResult, ServerStatus};
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::{
@@ -74,6 +75,8 @@ struct AppState {
     sys: Mutex<System>,
     job_sender: mpsc::SyncSender<ReconstructionJob>,
     metrics: Arc<ServerMetrics>,
+    signal_cache: Arc<HashMap<String, Arc<Array1<f64>>>>,
+    h_cache: Arc<HashMap<String, Arc<Array2<f64>>>>,
 }
 
 fn write_report_entry(result: &ReconstructionResult, image_filename: &str) -> std::io::Result<()> {
@@ -138,7 +141,33 @@ async fn main() {
         MEMORY_UNIT_MB
     );
 
-    
+    // Pré-carrega as planilhas H e todos os sinais g/G disponíveis.
+    let mut signal_cache: HashMap<String, Arc<Array1<f64>>> = HashMap::new();
+    let mut h_cache: HashMap<String, Arc<Array2<f64>>> = HashMap::new();
+    let cwd = std::env::current_dir().expect("[Servidor] Falha ao obter o diretório atual");
+    for entry in std::fs::read_dir(&cwd).expect("[Servidor] Falha ao ler o diretório atual") {
+        let entry = entry.expect("[Servidor] Falha ao ler entrada de diretório");
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let file_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        let upper = file_name.to_uppercase();
+        if upper.starts_with("H-") && upper.ends_with(".CSV") {
+            let matrix = reconstruction::read_h_matrix_from_csv(path.to_string_lossy().as_ref())
+                .unwrap_or_else(|e| panic!("[Servidor] Falha ao pré-carregar {}: {}", file_name, e));
+            h_cache.insert(file_name.clone(), Arc::new(matrix));
+        } else if (upper.starts_with("G-") || upper.starts_with("g-")) && upper.ends_with(".CSV") {
+            let vector = reconstruction::read_vector_from_csv(path.to_string_lossy().as_ref())
+                .unwrap_or_else(|e| panic!("[Servidor] Falha ao pré-carregar {}: {}", file_name, e));
+            signal_cache.insert(file_name.clone(), Arc::new(vector));
+        }
+    }
+    println!("[Servidor] Pré-carregou {} sinais e {} matrizes H com sucesso.", signal_cache.len(), h_cache.len());
+
     //fila de jobs com capacidade dinamica a memoria disponível
     let (job_sender, job_receiver) = mpsc::sync_channel::<ReconstructionJob>(queue_capacity);
     
@@ -152,6 +181,8 @@ async fn main() {
         sys: Mutex::new(sys),
         job_sender,
         metrics: metrics.clone(),
+        signal_cache: Arc::new(signal_cache),
+        h_cache: Arc::new(h_cache),
     });
 
     // Relatório periódico de métricas.
@@ -184,6 +215,8 @@ async fn main() {
     let dispatcher_receiver = job_receiver.clone();
     let dispatcher_metrics = metrics.clone();
     let dispatcher_semaphore = thread_semaphore.clone();
+    let dispatcher_signal_cache = shared_state.signal_cache.clone();
+    let dispatcher_h_cache = shared_state.h_cache.clone();
     thread::spawn(move || {
         println!("[Dispatcher] thread iniciada.");
         let mut job_id = 0;
@@ -202,7 +235,8 @@ async fn main() {
 
             let metrics = dispatcher_metrics.clone();
             let thread_semaphore = dispatcher_semaphore.clone();
-
+            let worker_signal_cache = dispatcher_signal_cache.clone();
+            let worker_h_cache = dispatcher_h_cache.clone();
 
             //cria a thread de worker para processar o job
             thread::spawn(move || {
@@ -222,25 +256,47 @@ async fn main() {
                         return;
                     }
                 };
-                // lê a matriz de reconstrção correspondente ao modelo 
-                let h_file = format!("H-{}.csv", request.model_id);
-                let s_samples = request.g.len();
-                let n_pixels = image_pixels.0 * image_pixels.1;
-
                 let algorithm_id = request.algorithm_id.clone();
                 let user_id = request.user_id;
-                let g_vec = request.g;
+                let signal_file = request.signal_file.clone();
 
-                let h_matrix = match reconstruction::read_h_matrix_from_csv(&h_file, s_samples, n_pixels) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        eprintln!("[Worker-{}] ERRO: Falha ao carregar o arquivo H: {}", worker_id, e);
-                        let _ = job.responder.send(ReconstructionResult::new_error(user_id, algorithm_id));
-                        metrics.active_jobs.fetch_sub(1, Ordering::Relaxed);
-                        thread_semaphore.release();
-                        return;
-                    }
+                let g_array = if let Some(signal) = worker_signal_cache.get(&signal_file) {
+                    signal.clone()
+                } else {
+                    eprintln!("[Worker-{}] ERRO: arquivo de sinal '{}' não encontrado no cache.", worker_id, signal_file);
+                    let _ = job.responder.send(ReconstructionResult::new_error(user_id, algorithm_id));
+                    metrics.active_jobs.fetch_sub(1, Ordering::Relaxed);
+                    thread_semaphore.release();
+                    return;
                 };
+
+                let h_file_name = format!("H-{}.csv", request.model_id);
+                let h_matrix = if let Some(matrix) = worker_h_cache.get(&h_file_name) {
+                    matrix.clone()
+                } else {
+                    eprintln!("[Worker-{}] ERRO: matriz H '{}' não encontrada no cache.", worker_id, h_file_name);
+                    let _ = job.responder.send(ReconstructionResult::new_error(user_id, algorithm_id));
+                    metrics.active_jobs.fetch_sub(1, Ordering::Relaxed);
+                    thread_semaphore.release();
+                    return;
+                };
+
+                let s_samples = g_array.len();
+                let n_pixels = image_pixels.0 * image_pixels.1;
+                if h_matrix.shape()[0] != s_samples {
+                    eprintln!("[Worker-{}] ERRO: tamanho de g ({}) não coincide com número de linhas de H ({}).", worker_id, s_samples, h_matrix.shape()[0]);
+                    let _ = job.responder.send(ReconstructionResult::new_error(user_id, algorithm_id));
+                    metrics.active_jobs.fetch_sub(1, Ordering::Relaxed);
+                    thread_semaphore.release();
+                    return;
+                }
+                if h_matrix.shape()[1] != n_pixels {
+                    eprintln!("[Worker-{}] ERRO: dimensões de H ({}, {}) não coincidem com o número de pixels {} do modelo {}.", worker_id, h_matrix.shape()[0], h_matrix.shape()[1], n_pixels, request.model_id);
+                    let _ = job.responder.send(ReconstructionResult::new_error(user_id, algorithm_id));
+                    metrics.active_jobs.fetch_sub(1, Ordering::Relaxed);
+                    thread_semaphore.release();
+                    return;
+                }
 
                 // Executa o algoritmo de reconstrução
                 let result = match algorithm_id.as_str() {
@@ -248,14 +304,14 @@ async fn main() {
                         &algorithm_id,
                         user_id,
                         &h_matrix,
-                        &Array1::from(g_vec.clone()),
+                        g_array.as_ref(),
                         image_pixels,
                     ),
                     "CGNE" => reconstruction::execute_cgne(
                         &algorithm_id,
                         user_id,
                         &h_matrix,
-                        &Array1::from(g_vec.clone()),
+                        g_array.as_ref(),
                         image_pixels,
                     ),
                     other => {
